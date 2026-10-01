@@ -105,3 +105,5 @@ export interface AIWasteAssistantResult {
   disposal_instruction: string;
   helpful_tip: string;
 }
+
+export * from './incident';

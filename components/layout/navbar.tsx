@@ -133,6 +133,16 @@ export function Navbar() {
               >
                 Manage Pickups
               </Link>
+              <Link
+                href="/admin/incidents"
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  pathname.startsWith('/admin/incidents')
+                    ? 'bg-white dark:bg-slate-800 text-purple-700 dark:text-purple-400 shadow-sm'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                Smart Incidents
+              </Link>
             </>
           )}
         </nav>

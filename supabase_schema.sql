@@ -206,3 +206,72 @@ VALUES
 ('Plastic Bottles & Containers', 'Recyclable Waste', 'PET drink bottles, HDPE milk jugs, shampoo bottles, and clean plastic containers.', 'Rinse out any residual liquids. Crush bottles to minimize space and cap them tightly for recycling.'),
 ('Batteries & E-Waste', 'Hazardous Waste', 'Used lithium batteries, old phones, chargers, light bulbs, and small electronics.', 'Never dispose of with general waste. Drop off at designated college/city e-waste collection points.')
 ON CONFLICT DO NOTHING;
+
+-- ==================================================
+-- 6. SMART WASTE INCIDENTS
+-- ==================================================
+CREATE TABLE IF NOT EXISTS public.incidents (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    incident_code TEXT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    issue_type TEXT NOT NULL,
+    location_text TEXT NOT NULL,
+    latitude NUMERIC,
+    longitude NUMERIC,
+    report_count INTEGER NOT NULL DEFAULT 1,
+    attention_level TEXT NOT NULL CHECK (attention_level IN ('low', 'medium', 'high')),
+    community_signal TEXT NOT NULL CHECK (community_signal IN ('weak', 'moderate', 'strong')),
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'monitoring', 'resolved')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ==================================================
+-- 7. INCIDENT COMPLAINTS RELATION
+-- ==================================================
+CREATE TABLE IF NOT EXISTS public.incident_complaints (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    incident_id UUID NOT NULL REFERENCES public.incidents(id) ON DELETE CASCADE,
+    complaint_id UUID NOT NULL REFERENCES public.complaints(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_incident_complaint UNIQUE (incident_id, complaint_id)
+);
+
+-- INDEXES FOR INCIDENTS
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON public.incidents(status);
+CREATE INDEX IF NOT EXISTS idx_incidents_attention ON public.incidents(attention_level);
+CREATE INDEX IF NOT EXISTS idx_incidents_created_at ON public.incidents(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_incident_complaints_incident_id ON public.incident_complaints(incident_id);
+CREATE INDEX IF NOT EXISTS idx_incident_complaints_complaint_id ON public.incident_complaints(complaint_id);
+
+-- TRIGGER FOR INCIDENTS UPDATED_AT
+CREATE TRIGGER update_incidents_updated_at BEFORE UPDATE ON public.incidents FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ROW LEVEL SECURITY FOR INCIDENTS (ADMIN ONLY)
+ALTER TABLE public.incidents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.incident_complaints ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Only admins can view incidents"
+  ON public.incidents FOR SELECT
+  USING (public.is_admin());
+
+CREATE POLICY "Only admins can insert incidents"
+  ON public.incidents FOR INSERT
+  WITH CHECK (public.is_admin());
+
+CREATE POLICY "Only admins can update incidents"
+  ON public.incidents FOR UPDATE
+  USING (public.is_admin())
+  WITH CHECK (public.is_admin());
+
+CREATE POLICY "Only admins can view incident complaints"
+  ON public.incident_complaints FOR SELECT
+  USING (public.is_admin());
+
+CREATE POLICY "Only admins can insert incident complaints"
+  ON public.incident_complaints FOR INSERT
+  WITH CHECK (public.is_admin());
+
+CREATE POLICY "Only admins can delete incident complaints"
+  ON public.incident_complaints FOR DELETE
+  USING (public.is_admin());

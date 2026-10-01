@@ -132,3 +132,62 @@ function getCategoryFromIssueType(issueType: IssueType): string {
       return 'General Waste Issue';
   }
 }
+
+export interface IncidentSimilarityResult {
+  same_incident: boolean;
+  reason: string;
+}
+
+export async function evaluateIncidentSimilarityWithGroq(
+  descA: string,
+  descB: string,
+  locA?: string,
+  locB?: string
+): Promise<IncidentSimilarityResult> {
+  const fallback: IncidentSimilarityResult = {
+    same_incident: true,
+    reason: 'Proximity and issue type match based on deterministic rules.',
+  };
+
+  if (!groq) {
+    return fallback;
+  }
+
+  try {
+    const prompt = `You are a Smart Waste Incident Fusion AI. Determine whether two citizen complaints likely describe the SAME real-world waste problem or event.
+
+Complaint A:
+Location: ${locA || 'Unspecified'}
+Description: "${descA}"
+
+Complaint B:
+Location: ${locB || 'Unspecified'}
+Description: "${descB}"
+
+Respond ONLY with a raw valid JSON object:
+{
+  "same_incident": true,
+  "reason": "1 concise sentence explaining why they are or are not the same underlying waste problem"
+}
+Output plain JSON only without markdown formatting.`;
+
+    const completion = await groq.chat.completions.create({
+      messages: [{ role: 'user', content: prompt }],
+      model: 'llama-3.3-70b-versatile',
+      temperature: 0.1,
+      max_tokens: 150,
+    });
+
+    const text = completion.choices[0]?.message?.content?.trim() || '';
+    const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(cleanText);
+
+    return {
+      same_incident: typeof parsed.same_incident === 'boolean' ? parsed.same_incident : true,
+      reason: parsed.reason || fallback.reason,
+    };
+  } catch (error) {
+    console.warn('Groq incident similarity evaluation error, falling back to deterministic:', error);
+    return fallback;
+  }
+}

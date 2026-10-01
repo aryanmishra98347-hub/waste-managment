@@ -9,21 +9,29 @@ import {
   Profile,
   IssueType,
   PickupWasteType,
-  PickupQuantity
+  PickupQuantity,
+  Incident,
+  IncidentStatus,
+  IncidentComplaint
 } from '@/types/database';
 import { 
   INITIAL_COMPLAINTS, 
   INITIAL_PICKUPS, 
   INITIAL_AWARENESS, 
+  INITIAL_INCIDENTS,
+  INITIAL_INCIDENT_COMPLAINTS,
   DEMO_CITIZEN_PROFILE, 
   DEMO_ADMIN_PROFILE 
 } from './seedData';
 import { generateComplaintCode, generatePickupCode } from '@/lib/utils';
+import { clusterComplaintsIntoIncidents } from '@/lib/incidents/fusion';
 
 const STORAGE_KEYS = {
   COMPLAINTS: 'swm_complaints_v1',
   PICKUPS: 'swm_pickups_v1',
   HISTORY: 'swm_history_v1',
+  INCIDENTS: 'swm_incidents_v1',
+  INCIDENT_COMPLAINTS: 'swm_incident_complaints_v1',
   CURRENT_USER: 'swm_current_user_v1',
 };
 
@@ -35,6 +43,8 @@ function isSupabaseConfigured(): boolean {
 // In-Memory Fallback State (initialized with seed data)
 let localComplaints: Complaint[] = [...INITIAL_COMPLAINTS];
 let localPickups: PickupRequest[] = [...INITIAL_PICKUPS];
+let localIncidents: Incident[] = [...INITIAL_INCIDENTS];
+let localIncidentComplaints: IncidentComplaint[] = [...INITIAL_INCIDENT_COMPLAINTS];
 let localHistory: ComplaintStatusHistory[] = [
   {
     id: 'h-1045-1',
@@ -114,6 +124,12 @@ function loadLocalState() {
 
     const savedH = localStorage.getItem(STORAGE_KEYS.HISTORY);
     if (savedH) localHistory = JSON.parse(savedH);
+
+    const savedI = localStorage.getItem(STORAGE_KEYS.INCIDENTS);
+    if (savedI) localIncidents = JSON.parse(savedI);
+
+    const savedIC = localStorage.getItem(STORAGE_KEYS.INCIDENT_COMPLAINTS);
+    if (savedIC) localIncidentComplaints = JSON.parse(savedIC);
   } catch (e) {
     console.error('Error loading local state:', e);
   }
@@ -125,6 +141,8 @@ function saveLocalState() {
     localStorage.setItem(STORAGE_KEYS.COMPLAINTS, JSON.stringify(localComplaints));
     localStorage.setItem(STORAGE_KEYS.PICKUPS, JSON.stringify(localPickups));
     localStorage.setItem(STORAGE_KEYS.HISTORY, JSON.stringify(localHistory));
+    localStorage.setItem(STORAGE_KEYS.INCIDENTS, JSON.stringify(localIncidents));
+    localStorage.setItem(STORAGE_KEYS.INCIDENT_COMPLAINTS, JSON.stringify(localIncidentComplaints));
   } catch (e) {
     console.error('Error saving local state:', e);
   }
@@ -540,4 +558,237 @@ export async function fetchAwarenessContent(): Promise<AwarenessContent[]> {
     console.warn('Supabase fetchAwarenessContent fallback:', e);
     return INITIAL_AWARENESS;
   }
+}
+
+// ----------------------------------------------------
+// SMART WASTE INCIDENT FUSION FUNCTIONS
+// ----------------------------------------------------
+
+function hydrateIncidentComplaints(
+  incident: Incident,
+  relations: IncidentComplaint[],
+  complaints: Complaint[]
+): Incident {
+  const linkedCIds = relations
+    .filter((r) => r.incident_id === incident.id)
+    .map((r) => r.complaint_id);
+
+  const matchedComplaints = complaints.filter((c) => linkedCIds.includes(c.id));
+  
+  // Sort complaints by creation date
+  matchedComplaints.sort(
+    (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+  );
+
+  const firstReported = matchedComplaints[0]?.created_at || incident.created_at;
+  const latestReported =
+    matchedComplaints[matchedComplaints.length - 1]?.created_at || incident.updated_at;
+
+  return {
+    ...incident,
+    report_count: matchedComplaints.length > 0 ? matchedComplaints.length : incident.report_count,
+    complaints: matchedComplaints,
+    first_reported_at: firstReported,
+    latest_reported_at: latestReported,
+  };
+}
+
+const ATTENTION_PRIORITY: Record<string, number> = {
+  high: 3,
+  medium: 2,
+  low: 1,
+};
+
+export async function fetchIncidents(): Promise<Incident[]> {
+  loadLocalState();
+
+  if (!isSupabaseConfigured()) {
+    const hydrated = localIncidents.map((inc) =>
+      hydrateIncidentComplaints(inc, localIncidentComplaints, localComplaints)
+    );
+
+    // Sort by: 1. Attention level (High > Medium > Low), 2. Report count (desc), 3. Most recent activity (desc)
+    return hydrated.sort((a, b) => {
+      const pDiff = (ATTENTION_PRIORITY[b.attention_level] || 0) - (ATTENTION_PRIORITY[a.attention_level] || 0);
+      if (pDiff !== 0) return pDiff;
+      const countDiff = b.report_count - a.report_count;
+      if (countDiff !== 0) return countDiff;
+      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    });
+  }
+
+  try {
+    const supabase = createBrowserClient();
+    const { data: incData, error: incError } = await supabase
+      .from('incidents')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (incError || !incData) throw incError;
+
+    // Fetch relations
+    const { data: relData } = await supabase
+      .from('incident_complaints')
+      .select('*, complaint:complaints(*, profile:profiles(*))');
+
+    const incidentsList = (incData as Incident[]).map((inc) => {
+      const incRels = (relData || []).filter((r: any) => r.incident_id === inc.id);
+      const incComplaints = incRels
+        .map((r: any) => r.complaint)
+        .filter(Boolean) as Complaint[];
+
+      incComplaints.sort(
+        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+
+      return {
+        ...inc,
+        report_count: incComplaints.length > 0 ? incComplaints.length : inc.report_count,
+        complaints: incComplaints,
+        first_reported_at: incComplaints[0]?.created_at || inc.created_at,
+        latest_reported_at:
+          incComplaints[incComplaints.length - 1]?.created_at || inc.updated_at,
+      };
+    });
+
+    return incidentsList.sort((a, b) => {
+      const pDiff = (ATTENTION_PRIORITY[b.attention_level] || 0) - (ATTENTION_PRIORITY[a.attention_level] || 0);
+      if (pDiff !== 0) return pDiff;
+      const countDiff = b.report_count - a.report_count;
+      if (countDiff !== 0) return countDiff;
+      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    });
+  } catch (e) {
+    console.warn('Supabase fetchIncidents fallback to local state:', e);
+    const hydrated = localIncidents.map((inc) =>
+      hydrateIncidentComplaints(inc, localIncidentComplaints, localComplaints)
+    );
+    return hydrated.sort((a, b) => {
+      const pDiff = (ATTENTION_PRIORITY[b.attention_level] || 0) - (ATTENTION_PRIORITY[a.attention_level] || 0);
+      if (pDiff !== 0) return pDiff;
+      const countDiff = b.report_count - a.report_count;
+      if (countDiff !== 0) return countDiff;
+      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    });
+  }
+}
+
+export async function fetchIncidentById(id: string): Promise<Incident | null> {
+  loadLocalState();
+
+  if (!isSupabaseConfigured()) {
+    const found = localIncidents.find((i) => i.id === id || i.incident_code === id);
+    if (!found) return null;
+    return hydrateIncidentComplaints(found, localIncidentComplaints, localComplaints);
+  }
+
+  try {
+    const supabase = createBrowserClient();
+    const { data: inc, error } = await supabase
+      .from('incidents')
+      .select('*')
+      .or(`id.eq.${id},incident_code.eq.${id}`)
+      .single();
+
+    if (error || !inc) throw error;
+
+    // Fetch related complaints
+    const { data: relData } = await supabase
+      .from('incident_complaints')
+      .select('*, complaint:complaints(*, profile:profiles(*))')
+      .eq('incident_id', inc.id);
+
+    const relatedComplaints = (relData || [])
+      .map((r: any) => r.complaint)
+      .filter(Boolean) as Complaint[];
+
+    relatedComplaints.sort(
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+    );
+
+    return {
+      ...(inc as Incident),
+      report_count: relatedComplaints.length > 0 ? relatedComplaints.length : inc.report_count,
+      complaints: relatedComplaints,
+      first_reported_at: relatedComplaints[0]?.created_at || inc.created_at,
+      latest_reported_at:
+        relatedComplaints[relatedComplaints.length - 1]?.created_at || inc.updated_at,
+    };
+  } catch (e) {
+    console.warn('Supabase fetchIncidentById fallback to local state:', e);
+    const found = localIncidents.find((i) => i.id === id || i.incident_code === id);
+    if (!found) return null;
+    return hydrateIncidentComplaints(found, localIncidentComplaints, localComplaints);
+  }
+}
+
+export async function updateIncidentStatus(
+  incidentId: string,
+  newStatus: IncidentStatus
+): Promise<Incident> {
+  loadLocalState();
+  const now = new Date().toISOString();
+
+  const idx = localIncidents.findIndex((i) => i.id === incidentId || i.incident_code === incidentId);
+  if (idx !== -1) {
+    localIncidents[idx] = {
+      ...localIncidents[idx],
+      status: newStatus,
+      updated_at: now,
+    };
+    saveLocalState();
+  }
+
+  if (!isSupabaseConfigured()) {
+    const updated = localIncidents[idx] || localIncidents[0];
+    return hydrateIncidentComplaints(updated, localIncidentComplaints, localComplaints);
+  }
+
+  try {
+    const supabase = createBrowserClient();
+    const { data, error } = await supabase
+      .from('incidents')
+      .update({
+        status: newStatus,
+        updated_at: now,
+      })
+      .or(`id.eq.${incidentId},incident_code.eq.${incidentId}`)
+      .select()
+      .single();
+
+    if (error || !data) throw error;
+    return fetchIncidentById(data.id) as Promise<Incident>;
+  } catch (e) {
+    console.warn('Supabase updateIncidentStatus fallback to local:', e);
+    const updated = localIncidents[idx] || localIncidents[0];
+    return hydrateIncidentComplaints(updated, localIncidentComplaints, localComplaints);
+  }
+}
+
+export async function triggerIncidentFusion(): Promise<{
+  incidents: Incident[];
+  newIncidentCount: number;
+}> {
+  loadLocalState();
+  const prevCount = localIncidents.length;
+
+  const { incidents: fusedIncidents, relations: fusedRelations } =
+    clusterComplaintsIntoIncidents(
+      localComplaints,
+      localIncidents,
+      localIncidentComplaints
+    );
+
+  localIncidents = fusedIncidents;
+  localIncidentComplaints = fusedRelations;
+  saveLocalState();
+
+  const hydrated = localIncidents.map((inc) =>
+    hydrateIncidentComplaints(inc, localIncidentComplaints, localComplaints)
+  );
+
+  return {
+    incidents: hydrated,
+    newIncidentCount: Math.max(0, localIncidents.length - prevCount),
+  };
 }
